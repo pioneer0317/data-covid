@@ -1,0 +1,160 @@
+---
+title: "trust lab data challenge"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(lubridate)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(readr)
+library(plotly)
+library(scales)
+library(gganimate)
+library(png)
+library(gifski)
+library(openxlsx)
+
+us_confirmed <- read.csv(url("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_US.csv"), header = TRUE, sep= ",", check.names = FALSE)
+us_death <- read.csv(url("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv"), header = TRUE, sep = ",", check.names=FALSE) 
+vaccine <- read.csv(url("https://raw.githubusercontent.com/owid/covid-19-data/master/public/data/vaccinations/us_state_vaccinations.csv"), header = TRUE, sep = ",", check.names = FALSE)
+
+# data cleaning - pivot  
+temp <- us_confirmed[, 12:ncol(us_confirmed)]
+names(temp) <- as.Date(mdy(names(temp)), format = "%Y-%m-%d")
+us_confirmed <- cbind(us_confirmed[, 1:11], temp)
+us_confirmed <- us_confirmed %>% pivot_longer(cols = -c(1:11), names_to = "date", values_to = "confirmed_cases")
+us_confirmed$date <- as.POSIXct(us_confirmed$date)
+
+temp2 <- us_death[, 13:ncol(us_death)]
+names(temp2) <- mdy(names(temp2))
+us_death <- cbind(us_death[, 1:12], temp2)
+us_death <- us_death %>% pivot_longer(cols = -c(1:12), names_to = "date", values_to = "death_cases")
+us_death$date <- as.POSIXct(us_death$date)
+
+# merge confirmed and death cases datasets 
+common_cols <- names(us_confirmed)[names(us_confirmed) %in% names(us_death)]
+us <- merge(us_confirmed, us_death, by = common_cols) 
+# remove states/properties with 0 populations: Diamond Princess, Grand Princess 
+us <- us[us$Population != 0, ]
+# derive separate month and year columns 
+us$month <- month(as.POSIXlt(us$date, format = "%Y-%m-%d"))
+us$year <- year(as.POSIXlt(us$date, format = "%Y-%m-%d"))
+```
+
+# Webscrape US state population from Wikipedia and merge with the dataset 
+```{r}
+library(rvest)
+library(magrittr)
+
+state_population <- read_html("https://en.wikipedia.org/wiki/List_of_U.S._states_and_territories_by_population") %>%
+  html_nodes("table") %>%
+    .[[1]] %>%
+  html_table(fill=T) 
+
+state_population <- state_population[-c(1, 58:61), c(3, 4)]
+names(state_population) <- c("state", "population")
+state_population$population <- gsub("\\[.*?\\]", "", state_population$population)
+state_population$population <- gsub(",", "", state_population$population)
+state_population$population <- as.numeric(as.character(state_population$population))
+state_population$state[which(state_population$state == "U.S. Virgin Islands")] <- "Virgin Islands"
+
+us <- merge(us, state_population, by.x = "Province_State", by.y = "state")
+# derive new death and confirmed rates 
+us$death_rate <- us$death_cases/us$population
+us$confirmed_rate <- us$confirmed_cases / us$population
+```
+
+# State Total Population 
+```{r}
+state_population <- us[, c(1, ncol(us))] %>% distinct() 
+```
+
+# Get daily cases from cumulative data 
+```{r}
+# get daily death and confirmed cases 
+us <- us %>% group_by(Province_State) %>% mutate(daily_death_cases = c(death_cases[1], (death_cases - lag(death_cases))[-1]), daily_confirmed_cases = c(confirmed_cases[1], (confirmed_cases - lag(confirmed_cases))[-1])) %>% mutate(daily_confirmed_rates = daily_confirmed_cases/population, daily_death_rates = daily_death_cases/population)
+
+# Negative daily cases most likely mean the incorrect information is inputted. 
+us %>% mutate(daily_death_cases = ifelse(daily_death_cases < 0, 0, daily_death_cases)) 
+```
+
+# Vaccine 
+```{r}
+remove <- names(table(vaccine$location))[!(names(table(vaccine$location)) %in% names(table(us$Province_State)))]
+vaccine <- vaccine %>% filter(!location %in% remove)
+
+current_vaccine <- vaccine %>% group_by(location) %>% filter(row_number() == n()) %>% select(location, people_vaccinated, people_fully_vaccinated)
+us <- left_join(us, current_vaccine, by = c("Province_State" = "location"))
+```
+
+https://worldpopulationreview.com/state-rankings/poverty-rate-by-state
+
+
+```{r}
+pov <- read.csv("csvData.csv")
+pov <- pov[, -3]
+pov <- pov %>% rename(state = `ï..State`, poverty_rate = PovertyRate)
+pov <- pov %>% add_row(state = "District of Columbia", poverty_rate = 0.141)
+
+poverty <- data.frame("Province_State" = c("Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut","Delaware",
+                                "District of Columbia", "Florida","Georgia","Hawaii","Idaho","Illinois",'Indiana',"Iowa","Kansas","Kentucky",
+                                "Louisiana","Maine","Maryland","Massachusetts","Michigan",
+                                "Minnesota","Mississippi","Missouri","Montana","Nebraska",
+                                "Nevada","New Hampshire","New Jersey","New Mexico","New York",
+                                "North Carolina","North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island","South Carolina",
+                                "South Dakota","Tennessee","Texas","Utah","Vermont","Virginia","Washington","West Virginia","Wisconsin","Wyoming"),
+           "red_state" = c(TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE, TRUE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, TRUE, FALSE, TRUE))
+poverty$red_state <- ifelse(poverty$red_state == TRUE, "Red State", "Blue State")
+
+data <- merge(pov, poverty, by.x = "state", by.y = "Province_State")
+data$poverty_level <- cut(data$poverty_rate, breaks = c(min(data$poverty_rate), median(data$poverty_rate), max(data$poverty_rate)), right = FALSE, include.lowest = TRUE, labels = c("Lower poverty level", "Higher poverty level"))
+
+df <- left_join(us, data, by = c("Province_State" = "state"))
+
+```
+
+```{r}
+# only consider the state level 
+state_df <- df %>% group_by(Province_State, date, poverty_level, population, red_state) %>% 
+  summarise(case_confirmed = sum(confirmed_cases), case_death = sum(death_cases), daily_case_confirmed = sum(daily_confirmed_cases), daily_case_death = sum(daily_death_cases), fully_vaccinated = max(people_fully_vaccinated), vaccinated = max(people_vaccinated))
+
+state_df <- state_df %>% mutate(confirmed_rate = case_confirmed/population, death_rate = case_death/population, daily_confirmed_rate = daily_case_confirmed/population, daily_death_rate = daily_case_death/population, fully_vaccinated_rate = fully_vaccinated/population, vaccinated_rate = vaccinated/population) 
+
+state <- state_df %>% group_by(Province_State) %>% filter(row_number() == n())
+
+#write.xlsx(state, "state_unique_data.xlsx")
+
+# multiple linear regression model 
+summary(lm(death_rate ~ confirmed_rate + red_state + poverty_level + vaccinated_rate + fully_vaccinated_rate, data = state_df))
+# anova for the R-squared calculation purpose 
+summary(aov(death_rate ~ confirmed_rate + red_state + poverty_level + vaccinated_rate + fully_vaccinated_rate, data = state_df))
+```
+
+```{r, fig.width=8}
+vaccine$date <- as.POSIXct(vaccine$date)
+california <- left_join(state_df, vaccine %>% select(location, date, people_vaccinated, people_fully_vaccinated, daily_vaccinations), by = c("Province_State" = "location", "date" = "date")) %>% filter(Province_State == "California")
+
+california$vaccine <- ifelse(is.na(california$daily_vaccinations), FALSE, TRUE)
+california$date <- as.Date(california$date)
+
+california[-1, ] %>% 
+  ggplot(aes(x = date, y = daily_death_rate, color = vaccine)) + geom_line() + 
+  ggtitle("Comparison of the Daily Death Rate Before and After Vaccination in California") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "1 month") + 
+  geom_vline(xintercept = as.numeric(as.Date("2021-01-13")), 
+              color = "navy", 
+              linetype = "dashed", 
+             lwd = 1.5) + 
+  annotate("text", x=as.Date("2020-11-05"), y=0.000024, label= "Vaccine Started \n in Jan 13th, 2021") + 
+  theme_classic() + 
+  theme(plot.title = element_text(h = 0.5), 
+        axis.text.x = element_text(angle = 90)) + 
+  ylab("Daily Death Rate") + xlab("Date")
+```
